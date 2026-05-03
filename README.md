@@ -1,28 +1,30 @@
-# 🛡️ SpeakerAuth - מערכת בקרת כניסה ביומטרית מבוססת זיהוי דובר
+# 🛡️ SpeakerAuth: Biometric Access Control System
 
-מערכת חכמה ומתקדמת לבקרת כניסה למתחמים מסווגים המבוססת על חתימת קול ביומטרית (Speaker Recognition). 
-המערכת קולטת אודיו בזמן אמת, מבצעת סינון רעשים ועיבוד אותות דיגיטלי לחילוץ מאפיינים ספקטרליים (MFCC), ומזהה את הדוברים ברמת דיוק גבוהה בעזרת מודל למידה עמוקה (Deep Learning).
+A state-of-the-art biometric access control system designed for classified facilities. 
+SpeakerAuth utilizes Voice Recognition to grant or deny access in real-time. The system captures live audio, performs noise suppression, extracts spectral features (MFCC) via a custom DSP engine, and identifies the speaker using a Deep Learning model.
 
-## 🏗️ ארכיטקטורת המערכת (Polyglot Architecture)
+## 🏗️ Polyglot Architecture
 
-המערכת תוכננה בארכיטקטורת שכבות מבוזרת תוך שימוש בגישת "הכלי הנכון למשימה" (Best of Breed), המשלבת מספר שפות תכנות הפועלות בסנכרון מושלם:
+The system is built using a micro-modular, polyglot architecture, ensuring that the "Best Tool for the Job" is used for each specific task:
 
-* **מנהל המערכת (Backend):** שרת **Java Spring Boot** המהווה את ה-Orchestrator של המערכת. הוא מנהל את קבלת הבקשות, מפעיל ומסנכרן את מנועי העיבוד השונים (C++ ו-Python) באמצעות `ProcessBuilder`, ומנהל את הלוגיקה העסקית.
-* **מסד נתונים (Database):** שרת **MySQL** מקומי. משמש לניהול בטוח של זהויות, הגדרת הרשאות כניסה ספציפיות לכל חדר (Access Control), ותיעוד היסטורי מקיף של כל ניסיונות הכניסה (Access Logs).
-* **מנוע עיבוד אותות (DSP):** מודול שנכתב מאפס ב-**C++**. מקבל את קובץ האודיו ומבצע עיבוד מתמטי ב-Low-Level הכולל נירמול (Normalization), חיתוך לחלונות, התמרת פורייה (FFT), וחישוב מטריצת MFCC כדי להפיק ייצוג ספקטרלי יציב ונקי.
-* **מנוע בינה מלאכותית (AI):** סקריפטים ב-**Python** האמונים על סינון רעשי רקע מתקדם (Denoising) ועל שכבת הסיווג. התכונות שחולצו ב-C++ מוזנות לתוך מודל Deep Learning המבצע זיהוי ומפיק החלטה סטטיסטית ורמת ביטחון (Confidence Score).
-* **ממשק משתמש (Frontend):** אפליקציית **React** רספונסיבית הכוללת מסכי הדמיה של עמדות קצה (טאבלטים בדלתות) המאפשרים הקלטת אודיו בזמן אמת מתוך הדפדפן, ולוח בקרה (C5I Dashboard) למנהל האבטחה לניהול הרשאות ואימון המערכת.
+* **Backend Orchestrator (Java / Spring Boot):** Acts as the central nervous system. It handles HTTP requests, orchestrates the C++ and Python sub-processes via `ProcessBuilder`, enforces business logic, and manages database transactions.
+* **Database (MySQL):** A relational database ensuring ACID compliance. It manages user identities, room-specific access control (Authorization), and maintains a strict audit trail (Access Logs).
+* **DSP Engine (C++):** A custom, dependency-free C++ engine. It parses binary WAV files, applies pre-emphasis, windowing, and performs Fast Fourier Transform (FFT) and MFCC extraction. Running close to the metal ensures low-latency signal processing.
+* **AI & Denoising Engine (Python):** Handles the machine learning workload. It applies Spectral Gating for background noise suppression and utilizes Scikit-Learn (Deep Neural Network / Random Forest) to classify the extracted feature vectors and generate a Confidence Score.
+* **Frontend (React.js):** A modern Single Page Application (SPA). It provides a secure admin dashboard (C5I) for user management/training, and simulated door-terminal interfaces that capture live microphone audio via the native Web Audio API.
 
-## ⚙️ זרימת המידע (Data Flow)
-1. **קלט:** המשתמש מקליט את קולו דרך הדפדפן מול דלת ספציפית.
-2. **עיבוד מקדים:** השרת מעביר את הקובץ לניקוי רעשים ולחילוץ מאפיינים ב-C++.
-3. **הסקה (Inference):** וקטור התכונות מועבר למודל ה-Deep Learning ב-Python לקבלת זהות הדובר.
-4. **אימות (Authorization):** השרת בודק מול ה-MySQL האם המשתמש שזוהה פעיל, האם אחוז הביטחון גבוה מספיק, והאם יש לו הרשאה לחדר המבוקש.
-5. **תגובה:** נרשם תיעוד מלא במסד הנתונים, והדלת נפתחת (או נדחית גישה) במסך המשתמש.
+## ⚙️ Data Flow Pipeline
 
-## 🚀 טכנולוגיות
-* **Backend:** Java 21, Spring Boot, Spring Data JPA, Hibernate.
-* **Frontend:** React.js, Vite, Axios, Tailwind CSS / Lucide React.
-* **Database:** MySQL.
-* **DSP:** C++ (Native FFT & MFCC extraction).
-* **AI:** Python, Scikit-Learn, NumPy, Joblib, Spectral Gating Denoising.
+1. **Ingestion:** The user records their voice at a specific door terminal via the browser.
+2. **Preprocessing:** The Java backend receives the audio and passes it to Python for noise reduction, and then to C++ for mathematical feature extraction (outputting a feature vector).
+3. **Inference:** The AI model evaluates the features and returns the predicted identity along with a confidence score.
+4. **Authorization:** The Java backend verifies the confidence threshold, checks if the user exists in MySQL, and confirms they have permission for the requested room.
+5. **Resolution:** The access log is securely recorded, and the client terminal displays either "ACCESS GRANTED" or "ACCESS DENIED".
+
+## 🚀 Tech Stack
+
+* **Core Backend:** Java 21, Spring Boot, Hibernate / JPA
+* **Frontend:** React, Vite, Axios, Tailwind CSS, Lucide Icons
+* **Database:** MySQL
+* **Signal Processing:** Vanilla C++ (Custom FFT implementation)
+* **Machine Learning:** Python, Scikit-Learn, NumPy, Joblib
