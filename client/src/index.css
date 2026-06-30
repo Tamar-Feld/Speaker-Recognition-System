@@ -1,68 +1,29 @@
-:root {
-  font-family: system-ui, Avenir, Helvetica, Arial, sans-serif;
-  line-height: 1.5;
-  font-weight: 400;
-
-  color-scheme: light dark;
-  color: rgba(255, 255, 255, 0.87);
-  background-color: #242424;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-a:hover {
-  color: #535bf2;
-}
-
-body {
+* {
   margin: 0;
-  display: flex;
-  place-items: center;
-  min-width: 320px;
-  min-height: 100vh;
+  padding: 0;
+  box-sizing: border-box;
 }
 
-h1 {
-  font-size: 3.2em;
-  line-height: 1.1;
+html, body {
+  height: 100%;
+  background: #0a0a0a;
 }
 
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  background-color: #1a1a1a;
-  cursor: pointer;
-  transition: border-color 0.25s;
-}
-button:hover {
-  border-color: #646cff;
-}
-button:focus,
-button:focus-visible {
-  outline: 4px auto -webkit-focus-ring-color;
+#root {
+  /* NOTE: this element must stay un-clipped — clipping the root broke the
+     corridor's 3D rendering during an earlier debugging pass. Each page
+     (Corridor / Door / Admin) manages its own internal scroll/clipping. */
+  width: 100%;
+  height: 100%;
+  font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
 }
 
-@media (prefers-color-scheme: light) {
-  :root {
-    color: #213547;
-    background-color: #ffffff;
-  }
-  a:hover {
-    color: #747bff;
-  }
-  button {
-    background-color: #f9f9f9;
-  }
-}
+a { color: inherit; }
+
+/* Shared mic-visualizer bar animations — used by ScanModal in CorridorPage.jsx */
+@keyframes barBounce1 { 0%,100% { height: 10px; } 50% { height: 28px; } }
+@keyframes barBounce2 { 0%,100% { height: 18px; } 50% { height: 8px;  } }
+@keyframes barBounce3 { 0%,100% { height: 14px; } 50% { height: 32px; } }
+@keyframes barBounce4 { 0%,100% { height: 22px; } 50% { height: 10px; } }
+@keyframes barBounce5 { 0%,100% { height: 10px; } 50% { height: 24px; } }
+@keyframes barBounce6 { 0%,100% { height: 26px; } 50% { height: 14px; } }

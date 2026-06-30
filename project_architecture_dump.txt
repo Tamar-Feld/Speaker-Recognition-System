@@ -1,0 +1,984 @@
+====================================================
+        Project Architecture & Code Dump            
+====================================================
+
+// ======================================================================
+// FILE PATH: .\ai_engine\core\model.py
+// ======================================================================
+
+"""
+ai_engine/core/model.py
+═══════════════════════════════════════════════════════════════════
+ECAPA-TDNN — ארכיטקטורה מדויקת לפי best_model.pt (192 שכבות)
+נגזרת ישירות מניתוח checkpoint בסקריפט inspect_checkpoint.py.
+
+פרמטרים שאומנו: C=512, emb=192, scale=8
+קלט:  [Batch, 80, T]   — 80-dim Fbank filterbank features
+פלט:  [Batch, 192]     — L2-normalised speaker embedding
+
+מבנה:
+  stem       → Conv1d(80→512, k=5, bias=False) + BN
+  block1–3   → SERes2Block(C=512, scale=8)
+  mfa_conv   → Conv1d(1536→1536, k=1, bias=True)
+  pooling    → AttentivePool(1536) → [B, 3072]
+  bn_pool    → BN(3072)
+  fc_embed   → Linear(3072→192, bias=True)
+  bn_embed   → BN(192)
+  output     → L2-normalize
+═══════════════════════════════════════════════════════════════════
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ────────────────────────────────────────────────────────────────
+# SEBlock
+# fc.0 → Linear(C, C//4, bias=False)
+# fc.1 → ReLU
+# fc.2 → Linear(C//4, C, bias=False)
+# fc.3 → Sigmoid
+# checkpoint: se.fc.0.weight [128,512]  se.fc.2.weight [512,128]
+# ────────────────────────────────────────────────────────────────
+class SEBlock(nn.Module):
+    def __init__(self, C: int = 512):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(C, C // 4, bias=False),   # fc.0
+            nn.ReLU(),                            # fc.1
+            nn.Linear(C // 4, C, bias=False),   # fc.2
+            nn.Sigmoid(),                         # fc.3
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, T]
+        s = x.mean(dim=-1)          # [B, C] — global avg pool
+        s = self.fc(s)              # [B, C]
+        return x * s.unsqueeze(-1)  # [B, C, T]
+
+
+# ────────────────────────────────────────────────────────────────
+# Res2Conv1d
+# scale=8 → 7 branches: convs.0–6, bns.0–6
+# checkpoint: res2.convs.N.weight [64,64,3]  (no bias)
+#             res2.bns.N.weight   [64]
+# ────────────────────────────────────────────────────────────────
+class Res2Conv1d(nn.Module):
+    def __init__(self, C: int = 512, scale: int = 8, kernel_size: int = 3):
+        super().__init__()
+        assert C % scale == 0, f"C={C} must be divisible by scale={scale}"
+        self.scale = scale
+        width = C // scale          # 512 // 8 = 64
+        n = scale - 1               # 7 branches
+
+        self.convs = nn.ModuleList([
+            nn.Conv1d(width, width, kernel_size,
+                      padding=kernel_size // 2, bias=False)
+            for _ in range(n)
+        ])
+        self.bns = nn.ModuleList([
+            nn.BatchNorm1d(width) for _ in range(n)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, T]  →  split into scale chunks of width channels
+        chunks = x.chunk(self.scale, dim=1)
+        outs = []
+        y = None
+        for i, chunk in enumerate(chunks):
+            if i == 0:
+                # first chunk: identity (no conv)
+                outs.append(chunk)
+            elif y is None:
+                # second chunk: first conv branch, no accumulation
+                y = F.relu(self.bns[i - 1](self.convs[i - 1](chunk)))
+                outs.append(y)
+            else:
+                # remaining chunks: add previous branch output
+                y = F.relu(self.bns[i - 1](self.convs[i - 1](chunk + y)))
+                outs.append(y)
+        return torch.cat(outs, dim=1)   # [B, C, T]
+
+
+# ────────────────────────────────────────────────────────────────
+# SERes2Block
+# conv1  → Conv1d(C,C,1, bias=False) + BN + ReLU
+# res2   → Res2Conv1d(C, scale=8)
+# conv3  → Conv1d(C,C,1, bias=False) + BN + ReLU
+# se     → SEBlock(C)
+# + residual skip
+# ────────────────────────────────────────────────────────────────
+class SERes2Block(nn.Module):
+    def __init__(self, C: int = 512, scale: int = 8):
+        super().__init__()
+        self.conv1 = nn.Conv1d(C, C, 1, bias=False)
+        self.bn1   = nn.BatchNorm1d(C)
+        self.res2  = Res2Conv1d(C, scale=scale)
+        self.conv3 = nn.Conv1d(C, C, 1, bias=False)
+        self.bn3   = nn.BatchNorm1d(C)
+        self.se    = SEBlock(C)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = x
+        out = F.relu(self.bn1(self.conv1(x)))
+        out = self.res2(out)
+        out = F.relu(self.bn3(self.conv3(out)))
+        out = self.se(out)
+        return out + residual
+
+
+# ────────────────ד────────────────────────────────────────────────
+# AttentivePool
+# קלט:  [B, C, T]  C=1536
+# tdnn: Conv1d(C*3=4608, 128, 1)   — processes cat([x, mean, std])
+# attn: Conv1d(128, C=1536, 1)     — attention weights per channel
+# פלט:  [B, C*2=3072]              — cat(weighted_mean, weighted_std)
+#
+# checkpoint:
+#   pooling.tdnn.weight [128, 4608, 1]
+#   pooling.attn.weight [1536, 128, 1]
+# ────────────────────────────────────────────────────────────────
+class AttentivePool(nn.Module):
+    def __init__(self, C: int = 1536):
+        super().__init__()
+        self.tdnn = nn.Conv1d(C * 3, 128, 1)
+        self.attn = nn.Conv1d(128, C, 1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, 1536, T]
+        B, C, T = x.shape
+
+        # tile global mean and std to match time dimension
+        mean = x.mean(dim=-1, keepdim=True).expand(-1, -1, T)  # [B, C, T]
+        std  = x.std(dim=-1, keepdim=True).expand(-1, -1, T)   # [B, C, T]
+
+        feat = torch.cat([x, mean, std], dim=1)                  # [B, C*3=4608, T]
+        h    = torch.relu(self.tdnn(feat))                        # [B, 128, T]
+        a    = torch.softmax(self.attn(h), dim=-1)                # [B, C=1536, T]
+
+        # weighted statistics
+        mu  = (a * x).sum(dim=-1)                                 # [B, C]
+        rss = (a * x.pow(2)).sum(dim=-1)
+        sg  = (rss - mu.pow(2)).clamp(min=1e-8).sqrt()            # [B, C]
+
+        return torch.cat([mu, sg], dim=1)                          # [B, C*2=3072]
+
+
+# ════════════════════════════════════════════════════════════════
+# ECAPA_TDNN — המחלקה הראשית
+# ════════════════════════════════════════════════════════════════
+class ECAPA_TDNN(nn.Module):
+    """
+    ECAPA-TDNN(C=512, emb=192, scale=8)
+    תואמת בדיוק ל-best_model.pt — אין שגיאות load_state_dict.
+    """
+    def __init__(self, C: int = 512, emb: int = 192, scale: int = 8):
+        super().__init__()
+
+        # stem: Conv1d(80→C, k=5, bias=False) + BN
+        # checkpoint: stem.0.weight [512,80,5]  (NO bias → bias=False)
+        #             stem.1.*      BN(512)
+        self.stem = nn.Sequential(
+            nn.Conv1d(80, C, kernel_size=5, padding=2, bias=False),
+            nn.BatchNorm1d(C),
+        )
+
+        # 3 × SERes2Block
+        self.block1 = SERes2Block(C, scale)
+        self.block2 = SERes2Block(C, scale)
+        self.block3 = SERes2Block(C, scale)
+
+        # Multi-scale Feature Aggregation conv
+        # checkpoint: mfa_conv.weight [1536,1536,1]  mfa_conv.bias [1536]
+        self.mfa_conv = nn.Conv1d(C * 3, C * 3, 1)   # bias=True (default)
+
+        # Attentive Pooling
+        self.pooling = AttentivePool(C * 3)            # C*3=1536 → [B, 3072]
+
+        # Embedding layers
+        # checkpoint: bn_pool.weight [3072]
+        #             fc_embed.weight [192,3072]  fc_embed.bias [192]
+        #             bn_embed.weight [192]
+        self.bn_pool  = nn.BatchNorm1d(C * 6)         # 3072
+        self.fc_embed = nn.Linear(C * 6, emb)         # bias=True
+        self.bn_embed = nn.BatchNorm1d(emb)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: [B, 80, T]  — Fbank features
+        returns: [B, 192] — L2-normalised embedding
+        """
+        # Stem
+        x = F.relu(self.stem(x))       # [B, 512, T]
+
+        # Res2 blocks
+        e1 = self.block1(x)            # [B, 512, T]
+        e2 = self.block2(e1)           # [B, 512, T]
+        e3 = self.block3(e2)           # [B, 512, T]
+
+        # Multi-scale aggregation
+        cat = torch.cat([e1, e2, e3], dim=1)   # [B, 1536, T]
+        cat = F.relu(self.mfa_conv(cat))        # [B, 1536, T]
+
+        # Attentive pooling → fixed-size embedding
+        out = self.pooling(cat)                 # [B, 3072]
+        out = self.bn_pool(out)                 # [B, 3072]
+        out = self.fc_embed(out)                # [B, 192]
+        out = self.bn_embed(out)                # [B, 192]
+
+        # L2 normalise → unit sphere
+        return F.normalize(out, p=2, dim=1)    # [B, 192]
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\controllers\AccessLogController.java
+// ======================================================================
+
+package com.example.server.controllers;
+
+import com.example.server.entities.AccessLog;
+import com.example.server.repositories.AccessLogRepository;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.domain.Sort;
+import org.springframework.web.bind.annotation.*;
+import java.util.List;
+
+@RestController
+@RequestMapping("/api/logs")
+@CrossOrigin(origins = "*")
+public class AccessLogController {
+
+    @Autowired
+    private AccessLogRepository repository;
+
+    // שליפת כל הלוגים (מהחדש לישן)
+    @GetMapping
+    public List<AccessLog> getAllLogs() {
+        return repository.findAll(Sort.by(Sort.Direction.DESC, "timestamp"));
+    }
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\controllers\AudioController.java
+// ======================================================================
+
+package com.example.server.controllers;
+
+import com.example.server.entities.AccessLog;
+import com.example.server.entities.User;
+import com.example.server.repositories.AccessLogRepository;
+import com.example.server.repositories.RoomPermissionRepository;
+import com.example.server.repositories.UserRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.http.*;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@RestController
+@RequestMapping("/api/audio")
+@CrossOrigin(origins = "*")
+public class AudioController {
+
+    @Autowired private AccessLogRepository      accessLogRepository;
+    @Autowired private UserRepository           userRepository;
+    @Autowired private RoomPermissionRepository roomPermissionRepository;
+    @Autowired private ObjectMapper             objectMapper;
+
+    @Value("${ai.server.url:http://127.0.0.1:8000/predict}")
+    private String aiServerUrl;
+
+    // ── POST /api/audio/upload ──────────────────────────────────────────────
+    @PostMapping("/upload")
+    public ResponseEntity<Map<String, Object>> uploadFile(
+            @RequestParam("file")   MultipartFile file,
+            @RequestParam("roomId") int           roomId) {
+
+        try {
+            System.out.println("\n📡 [Gateway] Access request for room " + roomId);
+
+            // ── Step 1: Collect all enrolled embeddings from MySQL ────────────
+            Map<String, Object> embeddingsMap = new HashMap<>();
+            for (User u : userRepository.findAll()) {
+                String raw = u.getBiometricEmbedding();
+                if (raw == null || raw.isBlank()) continue;
+                try {
+                    List<Double> emb = objectMapper.readValue(
+                            raw, new TypeReference<List<Double>>(){});
+                    embeddingsMap.put(u.getUsername(), emb);
+                } catch (Exception e) {
+                    System.err.println("⚠️ [Gateway] Could not parse embedding for user: "
+                            + u.getUsername() + " — " + e.getMessage());
+                }
+            }
+            String embeddingsJson = objectMapper.writeValueAsString(embeddingsMap);
+            System.out.println("📦 [Gateway] Sending " + embeddingsMap.size()
+                    + " enrolled embedding(s) to FastAPI.");
+
+            // ── Step 2: Build multipart request (file + embeddings) ───────────
+            ByteArrayResource audioResource = new ByteArrayResource(file.getBytes()) {
+                @Override public String getFilename() {
+                    return file.getOriginalFilename() != null
+                            ? file.getOriginalFilename() : "audio.wav";
+                }
+            };
+
+            HttpHeaders fileHeaders = new HttpHeaders();
+            fileHeaders.setContentType(MediaType.APPLICATION_OCTET_STREAM);
+
+            HttpHeaders headers = new HttpHeaders();
+            headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+
+            MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
+            body.add("file",       new HttpEntity<>(audioResource, fileHeaders));
+            body.add("embeddings", embeddingsJson);
+
+            HttpEntity<MultiValueMap<String, Object>> request = new HttpEntity<>(body, headers);
+            RestTemplate restTemplate = new RestTemplate();
+
+            // ── Step 3: Call FastAPI /predict ─────────────────────────────────
+            long t0 = System.currentTimeMillis();
+            ResponseEntity<Map> aiResponse =
+                    restTemplate.postForEntity(aiServerUrl, request, Map.class);
+            System.out.println("⚡ [AI] Analysis done in "
+                    + (System.currentTimeMillis() - t0) + "ms");
+
+            if (aiResponse.getStatusCode() != HttpStatus.OK || aiResponse.getBody() == null) {
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                        .body(buildError("AI server returned no valid response"));
+            }
+
+            // ── Step 4: Parse AI response ─────────────────────────────────────
+            Map<String, Object> aiBody  = aiResponse.getBody();
+            Object matchedRaw           = aiBody.get("matched_username");
+            String detectedName         = (matchedRaw != null) ? matchedRaw.toString() : null;
+            double confidence           = Double.parseDouble(aiBody.get("confidence").toString());
+            // confidence is already 0.0–1.0 — no division needed
+
+            // ── Step 5: Business logic ────────────────────────────────────────
+            boolean isApproved      = false;
+            String  rejectionReason = "";
+
+            if (detectedName == null) {
+                rejectionReason = "No enrolled speakers to match against";
+
+            } else if (confidence < 0.60) {
+                rejectionReason = "Biometric confidence too low ("
+                        + String.format("%.1f", confidence * 100) + "%)";
+
+            } else {
+                User user = userRepository.findByUsername(detectedName);
+
+                if (user == null) {
+                    rejectionReason = "Speaker '" + detectedName + "' not registered in the system";
+
+                } else if (!user.isAuthorized()) {
+                    rejectionReason = "Access revoked (user blocked)";
+
+                } else {
+                    boolean hasAccess = roomPermissionRepository
+                            .existsByUsernameAndRoomNumber(detectedName, roomId);
+                    if (hasAccess) {
+                        isApproved = true;
+                    } else {
+                        rejectionReason = "No permission for room " + roomId;
+                    }
+                }
+            }
+
+            // ── Step 6: Persist AccessLog ─────────────────────────────────────
+            String cleanFilename = (file.getOriginalFilename() != null)
+                    ? file.getOriginalFilename() : "audio.wav";
+
+            accessLogRepository.save(new AccessLog(
+                    cleanFilename,
+                    detectedName,     // null when no match — FK removed, column allows null
+                    confidence,       // 0.0–1.0 stored in DB
+                    isApproved,
+                    roomId
+            ));
+
+            // ── Step 7: Response to React ─────────────────────────────────────
+            // Send confidence as 0.0–1.0; React multiplies by 100 for display in all pages
+            Map<String, Object> result = new HashMap<>();
+            result.put("accessGranted",     isApproved);
+            result.put("identifiedSpeaker", detectedName != null ? detectedName : "unknown");
+            result.put("confidence",        confidence);
+
+            if (isApproved) {
+                result.put("message", "✅ Access granted — welcome " + detectedName
+                        + ", door " + roomId + " is open");
+                System.out.println("✅ [Gateway] Approved: " + detectedName + " → room " + roomId);
+            } else {
+                result.put("message", "⛔ Access denied — " + rejectionReason);
+                System.out.println("⛔ [Gateway] Denied: " + rejectionReason);
+            }
+
+            return ResponseEntity.ok(result);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            try {
+                String logFilename = (file.getOriginalFilename() != null)
+                        ? file.getOriginalFilename() : "audio.wav";
+                accessLogRepository.save(new AccessLog(logFilename, null, 0.0, false, roomId));
+            } catch (Exception logEx) {
+                System.err.println("⚠️ [Gateway] Could not save error AccessLog: " + logEx.getMessage());
+            }
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(buildError(e.getMessage()));
+        }
+    }
+
+    private Map<String, Object> buildError(String reason) {
+        Map<String, Object> err = new HashMap<>();
+        err.put("accessGranted",     false);
+        err.put("identifiedSpeaker", "");
+        err.put("confidence",        0.0);
+        err.put("message",           "⛔ Server error: " + reason);
+        return err;
+    }
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\controllers\UserController.java
+// ======================================================================
+
+package com.example.server.controllers;
+
+import com.example.server.entities.RoomPermission;
+import com.example.server.entities.User;
+import com.example.server.repositories.RoomPermissionRepository;
+import com.example.server.repositories.UserRepository;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.core.io.ByteArrayResource;
+import org.springframework.http.*;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.LinkedMultiValueMap;
+import org.springframework.util.MultiValueMap;
+import org.springframework.web.bind.annotation.*;
+import org.springframework.web.client.RestTemplate;
+import org.springframework.web.multipart.MultipartFile;
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+@RestController
+@RequestMapping("/api/users")
+@CrossOrigin(origins = "*")
+public class UserController {
+
+    @Autowired private UserRepository           userRepository;
+    @Autowired private RoomPermissionRepository roomPermissionRepository;
+    @Autowired private ObjectMapper             objectMapper;
+
+    @Value("${ai.enroll.url:http://127.0.0.1:8000/enroll}")
+    private String aiEnrollUrl;
+
+    @Value("${upload.dir}")
+    private String uploadDirectory;
+
+    // ── GET /api/users → list of all users ────────────────────────────────
+    @GetMapping
+    public List<User> getAllUsers() {
+        return userRepository.findAll();
+    }
+
+    // ── PUT /api/users/{id}/toggle → toggle authorization ─────────────────
+    @Transactional
+    @PutMapping("/{id}/toggle")
+    public User toggleAuthorization(@PathVariable Long id) {
+        User user = userRepository.findById(id).orElseThrow();
+        user.setAuthorized(!user.isAuthorized());
+        return userRepository.save(user);
+    }
+
+    // ── GET /api/users/{username}/rooms → [1, 3, 5] ───────────────────────
+    @GetMapping("/{username}/rooms")
+    public List<Integer> getUserRooms(@PathVariable String username) {
+        return roomPermissionRepository
+                .findByUsername(username)
+                .stream()
+                .map(RoomPermission::getRoomNumber)
+                .collect(Collectors.toList());
+    }
+
+    // ── POST /api/users/{username}/rooms/{roomNum} → toggle permission ─────
+    @Transactional
+    @PostMapping("/{username}/rooms/{roomNum}")
+    public ResponseEntity<List<Integer>> toggleUserRoom(
+            @PathVariable String username,
+            @PathVariable int    roomNum) {
+
+        if (roomPermissionRepository.existsByUsernameAndRoomNumber(username, roomNum)) {
+            roomPermissionRepository.deleteByUsernameAndRoomNumber(username, roomNum);
+        } else {
+            roomPermissionRepository.save(new RoomPermission(username, roomNum));
+        }
+
+        List<Integer> updatedRooms = roomPermissionRepository
+                .findByUsername(username)
+                .stream()
+                .map(RoomPermission::getRoomNumber)
+                .collect(Collectors.toList());
+
+        return ResponseEntity.ok(updatedRooms);
+    }
+
+    // ── POST /api/users/register → biometric enrollment ───────────────────
+    // Spring disambiguates /register from /{username}/rooms/{roomNum}
+    // because they have different path-segment counts (1 vs 3 after the base).
+    @PostMapping("/register")
+    public ResponseEntity<?> registerUserAndEnroll(
+            @RequestParam("username") String          username,
+            @RequestParam("samples")  MultipartFile[] samples) {
+
+        if (samples == null || samples.length < 3) {
+            return ResponseEntity.badRequest().body(
+                    Map.of("error", "נדרשות לפחות שלוש הקלטות קוליות לרישום ביומטרי."));
+        }
+
+        try {
+            System.out.println("\n🆕 [Gateway] Registering user: " + username
+                    + " (" + samples.length + " samples)");
+
+            // ── Back up audio files to disk ───────────────────────────────
+            String safeUsername = username.replaceAll("[^a-zA-Z0-9_-]", "_");
+            Path userDir = Paths.get(uploadDirectory, safeUsername);
+            if (!Files.exists(userDir)) Files.createDirectories(userDir);
+            for (MultipartFile sample : samples) {
+                if (sample.getOriginalFilename() != null) {
+                    String safeFilename = Paths.get(sample.getOriginalFilename()).getFileName().toString();
+                    Files.write(userDir.resolve(safeFilename), sample.getBytes());
+                }
+            }
+
+            // ── Call FastAPI /enroll once per audio sample ────────────────
+            // FastAPI accepts one file per call and returns one 192-dim embedding.
+            // Java averages all returned embeddings and L2-normalizes before saving.
+            System.out.println("📡 [Gateway] Sending " + samples.length
+                    + " samples to AI for enrollment...");
+
+            List<List<Double>> allEmbeddings = new ArrayList<>();
+            for (int i = 0; i < samples.length; i++) {
+                MultipartFile sample = samples[i];
+                try {
+                    ByteArrayResource res = new ByteArrayResource(sample.getBytes()) {
+                        @Override public String getFilename() {
+                            return sample.getOriginalFilename() != null
+                                    ? sample.getOriginalFilename() : "sample.wav";
+                        }
+                    };
+
+                    HttpHeaders fileHdr = new HttpHeaders();
+                    fileHdr.setContentType(MediaType.APPLICATION_OCTET_STREAM);
+
+                    MultiValueMap<String, Object> enrollBody = new LinkedMultiValueMap<>();
+                    enrollBody.add("file", new HttpEntity<>(res, fileHdr));
+
+                    HttpHeaders enrollHdr = new HttpHeaders();
+                    enrollHdr.setContentType(MediaType.MULTIPART_FORM_DATA);
+
+                    ResponseEntity<Map> aiResp = new RestTemplate().postForEntity(
+                            aiEnrollUrl,
+                            new HttpEntity<>(enrollBody, enrollHdr),
+                            Map.class);
+
+                    if (aiResp.getStatusCode() == HttpStatus.OK && aiResp.getBody() != null) {
+                        Object rawEmb = aiResp.getBody().get("embedding");
+                        if (rawEmb != null) {
+                            List<Double> emb = objectMapper.convertValue(
+                                    rawEmb, new TypeReference<List<Double>>(){});
+                            if (emb.size() != 192) {
+                                System.err.println("   ⚠️ [Gateway] Sample " + (i + 1)
+                                        + " returned embedding of size " + emb.size()
+                                        + ", expected 192 — skipped.");
+                            } else {
+                                allEmbeddings.add(emb);
+                                System.out.println("   ✓ Sample " + (i + 1) + "/" + samples.length);
+                            }
+                        }
+                    }
+                } catch (Exception e) {
+                    System.err.println("   ⚠️ [Gateway] Sample " + (i + 1) + " failed: "
+                            + e.getMessage());
+                }
+            }
+
+            if (allEmbeddings.size() < 3) {
+                return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(
+                        Map.of("error", "רק " + allEmbeddings.size() + " מתוך " + samples.length
+                                + " הקלטות עובדו בהצלחה. נדרשות לפחות שלוש הקלטות תקינות לרישום."));
+            }
+
+            // ── Average embeddings element-wise ───────────────────────────
+            double[] mean = new double[192];
+            for (List<Double> emb : allEmbeddings) {
+                for (int i = 0; i < 192; i++) {
+                    mean[i] += emb.get(i);
+                }
+            }
+            for (int i = 0; i < 192; i++) {
+                mean[i] /= allEmbeddings.size();
+            }
+
+            // ── L2-normalize (mean of unit vectors ≠ unit vector) ─────────
+            double norm = 0;
+            for (double v : mean) norm += v * v;
+            norm = Math.sqrt(norm);
+            if (norm > 1e-9) {
+                for (int i = 0; i < 192; i++) mean[i] /= norm;
+            }
+
+            // ── Persist to MySQL ───────────────────────────────────────────
+            List<Double> finalEmbList = new ArrayList<>();
+            for (double v : mean) finalEmbList.add(v);
+            String embJson = objectMapper.writeValueAsString(finalEmbList);
+
+            User enrolled = userRepository.findByUsername(username);
+            if (enrolled == null) {
+                enrolled = new User(username, username, true);
+            }
+            enrolled.setBiometricEmbedding(embJson);
+            userRepository.save(enrolled);
+            System.out.println("💾 [Gateway] Embedding persisted to MySQL for: " + username
+                    + " (" + allEmbeddings.size() + " samples averaged)");
+
+            System.out.println("✅ [Gateway] Enrollment completed successfully!");
+            return ResponseEntity.ok(Map.of(
+                    "status",  "success",
+                    "message", "User '" + username + "' enrolled successfully using "
+                            + allEmbeddings.size() + " valid samples."
+            ));
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
+                    .body(Map.of("error", "Server error: " + e.getMessage()));
+        }
+    }
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\entities\AccessLog.java
+// ======================================================================
+
+package com.example.server.entities;  // ← שנה לפאקג' שלך אם שונה
+
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+
+@Entity
+@Table(name = "access_logs")
+public class AccessLog {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false)
+    private String filename;
+
+    @Column(nullable = false)
+    private LocalDateTime timestamp;
+
+    @Column(name = "identified_speaker", nullable = true, length = 100)
+    private String identifiedSpeaker;
+
+    @Column(nullable = false)
+    private double confidence;
+
+    @Column(name = "access_granted", nullable = false)
+    private boolean accessGranted;
+
+    @Column(name = "room_number", nullable = false)
+    private int roomNumber;
+
+    @Column(name = "ip_address", length = 45)
+    private String ipAddress;
+
+    @Column(name = "processing_time_ms")
+    private Long processingTimeMs;
+
+    @Column(name = "rejection_reason", length = 500)
+    private String rejectionReason;
+
+    /** חובה ל-JPA */
+    public AccessLog() {}
+
+    /** Constructor ראשי */
+    public AccessLog(String filename, String identifiedSpeaker,
+                     double confidence, boolean accessGranted, int roomNumber) {
+        this.filename          = filename;
+        this.identifiedSpeaker = identifiedSpeaker;
+        this.confidence        = confidence;
+        this.accessGranted     = accessGranted;
+        this.roomNumber        = roomNumber;
+        this.timestamp         = LocalDateTime.now();
+    }
+
+    // Getters
+    public Long getId()                  { return id; }
+    public String getFilename()          { return filename; }
+    public LocalDateTime getTimestamp()  { return timestamp; }
+    public String getIdentifiedSpeaker() { return identifiedSpeaker; }
+    public double getConfidence()        { return confidence; }
+    public boolean isAccessGranted()     { return accessGranted; }
+    public int getRoomNumber()           { return roomNumber; }
+    public String getIpAddress()         { return ipAddress; }
+    public Long getProcessingTimeMs()    { return processingTimeMs; }
+    public String getRejectionReason()   { return rejectionReason; }
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\entities\Admin.java
+// ======================================================================
+
+package com.example.server.entities;
+
+public class Admin {
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\entities\RoomPermission.java
+// ======================================================================
+
+package com.example.server.entities;
+
+import jakarta.persistence.*;
+
+@Entity
+@Table(name = "room_permissions")
+public class RoomPermission {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String username;   // שם המשתמש (למשל: tamar)
+    private int roomNumber;    // מספר החדר (1-6)
+
+    // בנאי ריק (חובה)
+    public RoomPermission() {}
+
+    // בנאי לשימוש שלנו
+    public RoomPermission(String username, int roomNumber) {
+        this.username = username;
+        this.roomNumber = roomNumber;
+    }
+
+    // Getters
+    public String getUsername() { return username; }
+    public int getRoomNumber() { return roomNumber; }
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\entities\User.java
+// ======================================================================
+
+package com.example.server.entities;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import jakarta.persistence.*;
+import java.time.LocalDateTime;
+
+// ═══════════════════════════════════════════════════════════════════
+// User.java — גרסה סופית מתוקנת
+//
+//  תיקון קריטי לעומת v1 שהוגש:
+//  biometricEmbedding  → nullable = true
+//  הסיבה: embedding נכתב רק לאחר enrollment מוצלח דרך FastAPI.
+//  ברגע הרישום הראשוני אין embedding — כל save() עם NOT NULL היה
+//  מוביל ל-DataIntegrityViolationException גם עם "" ב-DB constraints
+//  מסוימים. nullable = true הוא הנכון אדריכלית.
+//  (DB column יש לשנות גם: ראה migration_v2.sql)
+// ═══════════════════════════════════════════════════════════════════
+@Entity
+@Table(name = "users")
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(unique = true, nullable = false)
+    private String username;
+
+    @Column(name = "full_name", nullable = false, length = 100)
+    private String fullName;
+
+    @Column(name = "is_authorized", nullable = false)
+    private boolean isAuthorized;
+
+    @Column(name = "created_at", nullable = false)
+    private LocalDateTime createdAt;
+
+    /**
+     * nullable = true — נכתב רק לאחר enrollment מוצלח.
+     * Java מחשב ומאחסן את ה-embedding ב-MySQL (ארכיטקטורה Java-centric).
+     * FastAPI הוא stateless לחלוטין — אינו מאחסן מידע בין קריאות.
+     */
+    @JsonIgnore
+    @Column(name = "biometric_embedding", nullable = true, columnDefinition = "TEXT")
+    private String biometricEmbedding;
+
+    // ── Constructors ────────────────────────────────────────────
+
+    /** חובה ל-JPA */
+    public User() {}
+
+    /**
+     * Constructor ראשי — ברישום משתמש חדש.
+     * biometricEmbedding = null עד שה-FastAPI ירשום ויחזיר embedding.
+     */
+    public User(String username, String fullName, boolean isAuthorized) {
+        this.username           = username;
+        this.fullName           = fullName;
+        this.isAuthorized       = isAuthorized;
+        this.createdAt          = LocalDateTime.now();
+        this.biometricEmbedding = null;   // נכתב לאחר /enroll
+    }
+
+    // ── Getters ─────────────────────────────────────────────────
+    public Long getId()                   { return id; }
+    public String getUsername()           { return username; }
+    public String getFullName()           { return fullName; }
+    public boolean isAuthorized()         { return isAuthorized; }
+    public LocalDateTime getCreatedAt()   { return createdAt; }
+    public String getBiometricEmbedding() { return biometricEmbedding; }
+
+    // ── Setters ─────────────────────────────────────────────────
+    public void setUsername(String username)         { this.username = username; }
+    public void setFullName(String fullName)         { this.fullName = fullName; }
+    public void setAuthorized(boolean authorized)    { this.isAuthorized = authorized; }
+    public void setBiometricEmbedding(String emb)    { this.biometricEmbedding = emb; }
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\repositories\AccessLogRepository.java
+// ======================================================================
+
+package com.example.server.repositories;
+
+import com.example.server.entities.AccessLog;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface AccessLogRepository extends JpaRepository<AccessLog, Long> {
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\repositories\AdminRepository.java
+// ======================================================================
+
+package com.example.server.repositories;
+
+import com.example.server.entities.Admin;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface AdminRepository extends JpaRepository<Admin, Long> {
+}
+
+
+
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\repositories\RoomPermissionRepository.java
+// ======================================================================
+
+package com.example.server.repositories;
+
+import com.example.server.entities.RoomPermission;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.transaction.annotation.Transactional;
+
+import java.util.List;
+
+public interface RoomPermissionRepository extends JpaRepository<RoomPermission, Long> {
+
+    // קיים — בדיקת קיום הרשאה ספציפית
+    boolean existsByUsernameAndRoomNumber(String username, int roomNumber);
+
+    // חדש — שליפת כל החדרים של משתמש
+    List<RoomPermission> findByUsername(String username);
+
+    // חדש — מחיקת הרשאה ספציפית (חייב @Transactional לפעולת מחיקה derived)
+    @Transactional
+    void deleteByUsernameAndRoomNumber(String username, int roomNumber);
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\repositories\UserRepository.java
+// ======================================================================
+
+package com.example.server.repositories;
+
+import com.example.server.entities.User;
+import org.springframework.data.jpa.repository.JpaRepository;
+
+public interface UserRepository extends JpaRepository<User, Long> {
+    // פונקציית קסם: תמצא משתמש לפי השם שלו
+    User findByUsername(String username);
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\services\AdminService.java
+// ======================================================================
+
+package com.example.server.services;
+
+public class AdminService {
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\services\AudioService.java
+// ======================================================================
+
+package com.example.server.services;
+
+public class AudioService {
+}
+
+
+// ======================================================================
+// FILE PATH: .\server\src\main\java\com\example\server\services\UserService.java
+// ======================================================================
+
+package com.example.server.services;
+
+public class UserService {
+}
+
+
+// Extraction Complete. Total files processed: 15
