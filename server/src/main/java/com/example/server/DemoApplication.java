@@ -65,8 +65,11 @@ public class DemoApplication {
             if (adminRepository.count() == 0) {
                 logger.info("➕ אין מנהל רשום. יוצר מנהל ראשי (admin)...");
                 try {
-                    adminService.createAdmin("admin", "admin123");
-                    logger.warn("⚠️ שים לב: נוצר מנהל עם שם המשתמש 'admin' והסיסמה 'admin123'. יש לשנותה בהקדם!");
+                    if (adminRepository.count() == 0) {
+                        throw new IllegalStateException(
+                                "No admin configured. Set ADMIN_USERNAME and ADMIN_PASSWORD env vars."
+                        );
+                    }
                 } catch (DataIntegrityViolationException e) {
                     logger.info("ℹ️ מנהל 'admin' כבר קיים (נוצר על-ידי instance מקביל).");
                 } catch (IllegalArgumentException e) {

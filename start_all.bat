@@ -2,8 +2,7 @@
 chcp 65001 >nul
 
 :: ====== הגדר כאן את נתיב Java שלך ======
-set JAVA_HOME=C:\Program Files\Eclipse Adoptium\jdk-25.0.1.8-hotspot\bin\java.exe
-:: ==========================================
+set JAVA_HOME=C:\Program Files\Eclipse Adoptium\jdk-25.0.1.8-hotspot:: ==========================================
 
 set PATH=%JAVA_HOME%\bin;%PATH%
 

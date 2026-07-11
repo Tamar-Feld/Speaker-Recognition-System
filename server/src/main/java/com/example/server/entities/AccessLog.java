@@ -1,5 +1,4 @@
-package com.example.server.entities;  // ← שנה לפאקג' שלך אם שונה
-
+package com.example.server.entities;
 import jakarta.persistence.*;
 import java.time.LocalDateTime;
 
@@ -51,7 +50,15 @@ public class AccessLog {
         this.roomNumber        = roomNumber;
         this.timestamp         = LocalDateTime.now();
     }
-
+    /** Constructor מורחב — כולל IP, זמן עיבוד וסיבת דחייה פנימית (M-5) */
+    public AccessLog(String filename, String identifiedSpeaker,
+                     double confidence, boolean accessGranted, int roomNumber,
+                     String ipAddress, Long processingTimeMs, String rejectionReason) {
+        this(filename, identifiedSpeaker, confidence, accessGranted, roomNumber);
+        this.ipAddress = ipAddress;
+        this.processingTimeMs = processingTimeMs;
+        this.rejectionReason = rejectionReason;
+    }
     // Getters
     public Long getId()                  { return id; }
     public String getFilename()          { return filename; }

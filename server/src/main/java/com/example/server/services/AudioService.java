@@ -45,6 +45,9 @@ public class AudioService {
     @Value("${ai.server.url:http://127.0.0.1:8000/predict}")
     private String aiServerUrl;
 
+    @Value("${ai.api.key}")
+    private String aiApiKey;
+
     // חילוץ "מספר הקסם" להגדרות - ברירת מחדל 60%
     @Value("${biometric.confidence.threshold:0.60}")
     private double confidenceThreshold;
@@ -67,21 +70,20 @@ public class AudioService {
     }
 
     // ── הפעולה המרכזית: מזהה דובר ובודק הרשאת גישה לחדר ─────────────
-    public Map<String, Object> identifyAndCheckAccess(MultipartFile file, int roomId) throws Exception {
+    public Map<String, Object> identifyAndCheckAccess(MultipartFile file, int roomId, String clientIp) throws Exception {
 
+        long requestStartTime = System.currentTimeMillis();
         System.out.println("\n📡 [Gateway] Access request for room " + roomId);
 
-        // Step 1: איסוף כל ה-embeddings הפעילים מ-MySQL
         String embeddingsJson = collectEnrolledEmbeddingsAsJson();
-
-        // Step 2-3: שליחה ל-FastAPI /predict
         Map<String, Object> aiBody = callPredictApi(file, embeddingsJson);
 
-        // Step 3b: VAD rejection — FastAPI returned 422 (insufficient speech)
         if ("INSUFFICIENT_SPEECH".equals(aiBody.get("_rejection_code"))) {
             String logFilename = (file.getOriginalFilename() != null && !file.getOriginalFilename().isEmpty())
                     ? file.getOriginalFilename() : "audio.wav";
-            accessLogRepository.save(new AccessLog(logFilename, null, 0.0, false, roomId));
+            long elapsed = System.currentTimeMillis() - requestStartTime;
+            accessLogRepository.save(new AccessLog(logFilename, null, 0.0, false, roomId,
+                    clientIp, elapsed, "Insufficient speech detected (VAD)"));
             System.out.println("⛔ [Gateway] Rejected — insufficient speech in recording for room " + roomId);
             Map<String, Object> result = new HashMap<>();
             result.put("accessGranted", false);
@@ -91,46 +93,49 @@ public class AudioService {
             return result;
         }
 
-        // Step 4: פענוח תשובת ה-AI
         Object matchedRaw = aiBody.get("matched_username");
         String detectedName = (matchedRaw != null) ? matchedRaw.toString() : null;
 
-        // המרה בטוחה ל-Double (מונע קריסות אם Jackson מפרש כ-Integer)
         double confidence = aiBody.get("confidence") != null ?
                 ((Number) aiBody.get("confidence")).doubleValue() : 0.0;
 
-        // Step 5: לוגיקה עסקית — אישור/דחייה
         AccessDecision decision = evaluateAccess(detectedName, confidence, roomId);
 
-        // Step 6: שמירת AccessLog
         String cleanFilename = (file.getOriginalFilename() != null && !file.getOriginalFilename().isEmpty())
                 ? file.getOriginalFilename() : "audio.wav";
 
+        long elapsed = System.currentTimeMillis() - requestStartTime;
         accessLogRepository.save(new AccessLog(
-                cleanFilename, detectedName, confidence, decision.approved(), roomId));
+                cleanFilename, detectedName, confidence, decision.approved(), roomId,
+                clientIp, elapsed, decision.rejectionReason()));
 
-        // Step 7: בניית תשובה ל-React
         Map<String, Object> result = new HashMap<>();
         result.put("accessGranted", decision.approved());
-        result.put("identifiedSpeaker", detectedName != null ? detectedName : "unknown");
-        result.put("confidence", confidence);
 
         if (decision.approved()) {
+            // ללקוח: מותר לחשוף את הכל — הגישה כבר אושרה
+            result.put("identifiedSpeaker", detectedName);
+            result.put("confidence", confidence);
             result.put("message", "✅ Access granted — welcome " + detectedName + ", door " + roomId + " is open");
             System.out.println("✅ [Gateway] Approved: " + detectedName + " → room " + roomId);
         } else {
-            result.put("message", "⛔ Access denied — " + decision.rejectionReason());
-            System.out.println("⛔ [Gateway] Denied: " + decision.rejectionReason());
+            // ללקוח: תוצאה גנרית בלבד בדחייה — לא זהות, לא ציון, לא סיבה מדויקת
+            result.put("identifiedSpeaker", "unknown");
+            result.put("confidence", 0.0);
+            result.put("message", "⛔ Access denied");
+            // לשרת בלבד: הפרטים המלאים לצורך חקירה ודיבוג
+            System.out.println("⛔ [Gateway] Denied: " + decision.rejectionReason()
+                    + " (detected=" + detectedName + ", confidence=" + String.format("%.3f", confidence) + ")");
         }
 
         return result;
     }
-
     // ── שמירת לוג כשלון — נקרא מה-Controller בבלוק catch ───────────
-    public void saveFailedLog(String originalFilename, int roomId) {
+    public void saveFailedLog(String originalFilename, int roomId, String clientIp) {
         try {
             String logFilename = (originalFilename != null && !originalFilename.isEmpty()) ? originalFilename : "audio.wav";
-            accessLogRepository.save(new AccessLog(logFilename, null, 0.0, false, roomId));
+            accessLogRepository.save(new AccessLog(logFilename, null, 0.0, false, roomId,
+                    clientIp, null, "Server error during processing"));
         } catch (Exception logEx) {
             System.err.println("⚠️ [Gateway] Could not save error AccessLog: " + logEx.getMessage());
         }
@@ -142,7 +147,6 @@ public class AudioService {
         for (User u : userRepository.findAll()) {
             // סינון חשוב: אין לשלוח לפייתון עובדים שאינם מורשים/חסומים!
             if (!u.isAuthorized()) continue;
-
             String raw = u.getBiometricEmbedding();
             if (raw == null || raw.isBlank()) continue;
 
@@ -175,6 +179,7 @@ public class AudioService {
 
         HttpHeaders headers = new HttpHeaders();
         headers.setContentType(MediaType.MULTIPART_FORM_DATA);
+        headers.set("X-Api-Key", aiApiKey);
 
         MultiValueMap<String, Object> body = new LinkedMultiValueMap<>();
         body.add("file", new HttpEntity<>(audioResource, fileHeaders));

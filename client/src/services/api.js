@@ -25,6 +25,8 @@ export const uploadAudio = (file, roomId) => {
   const fd = new FormData()
   fd.append('file', file, 'recording.webm')
   fd.append('roomId', roomId)
+  fd.append('timestamp', Date.now().toString())
+  fd.append('nonce', crypto.randomUUID())
   return apiClient.post('/audio/upload', fd)
 }
 

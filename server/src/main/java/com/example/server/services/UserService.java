@@ -50,6 +50,8 @@ public class UserService {
     @Value("${ai.enroll.url:http://127.0.0.1:8000/enroll}")
     private String aiEnrollUrl;
 
+    @Value("${ai.api.key}")
+    private String aiApiKey;
     /**
      * Constructor Injection
      */
@@ -147,6 +149,7 @@ public class UserService {
 
                 HttpHeaders enrollHdr = new HttpHeaders();
                 enrollHdr.setContentType(MediaType.MULTIPART_FORM_DATA);
+                enrollHdr.set("X-Api-Key", aiApiKey);
 
                 ResponseEntity<Map> aiResp = restTemplate.postForEntity(
                         aiEnrollUrl, new HttpEntity<>(enrollBody, enrollHdr), Map.class);

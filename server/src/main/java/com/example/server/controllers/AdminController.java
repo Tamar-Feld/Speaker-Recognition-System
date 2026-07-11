@@ -20,7 +20,6 @@ import org.springframework.web.bind.annotation.*;
 
 @RestController
 @RequestMapping("/api/admin")
-@CrossOrigin(origins = "*")
 public class AdminController {
 
     private final AdminService adminService;
@@ -65,16 +64,25 @@ public class AdminController {
 
     /**
      * איפוס סיסמה למנהל קיים.
-     * (הערה: במערכת ייצור מלאה, נתיב זה עצמו צריך להיות מוגן בטוקן).
      */
     @PostMapping("/reset-password")
-    public ResponseEntity<BasicResponse> resetPassword(@RequestBody ResetPasswordRequest request) {
+    public ResponseEntity<BasicResponse> resetPassword(
+            @RequestBody ResetPasswordRequest request,
+            java.security.Principal principal) {
+
+        if (principal == null) {
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED)
+                    .body(new BasicResponse(false, "יש להתחבר לפני איפוס סיסמה"));
+        }
         try {
-            adminService.resetPassword(request.username(), request.newPassword());
+            // שם המשתמש נלקח מה-JWT המאומת, לא ממה שהלקוח שלח בגוף הבקשה —
+            // כך אי אפשר לאפס סיסמה של מנהל אחר, גם אם משנים את שדה ה-username בבקשה
+            adminService.resetPassword(principal.getName(), request.newPassword());
             return ResponseEntity.ok(new BasicResponse(true, "הסיסמה אופסה בהצלחה"));
 
         } catch (IllegalArgumentException e) {
             return ResponseEntity.badRequest()
                     .body(new BasicResponse(false, e.getMessage()));
         }
-    }}
+    }
+    }
