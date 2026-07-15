@@ -528,9 +528,7 @@ function ScanModal ({ roomId, onClose }) {
               <div className="ck-resnm">
                 {result.identifiedSpeaker || (phase === 'granted' ? 'מזוהה' : 'לא זוהה')}
               </div>
-              {result.confidence > 0 && (
-                <div className="ck-rescf">ביטחון: {Math.round(result.confidence)}%</div>
-              )}
+
               {phase === 'granted' && (
                 <div className="ck-resnav">פותח דלת… מועבר תוך 4 שניות</div>
               )}

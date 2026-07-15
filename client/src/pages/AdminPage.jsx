@@ -14,17 +14,24 @@
 // `<>...</>` fragment with `key` placed on the inner <tr> instead of the
 // fragment itself. React requires the key on the element returned directly
 // from .map(), so this now uses `<React.Fragment key={u.id}>` explicitly.
+//
+// P2 — enrollment now goes through useAudioRecorder (same hook as prediction)
+// so enrollment and prediction audio always share the same capture pipeline.
+// When P1 fixes the constraints inside the hook, both flows benefit
+// automatically with no further changes here.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import React, { useState, useEffect, useCallback } from 'react'
+import React, { useState, useEffect, useCallback, useRef } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAdminAuthContext } from '../context/AdminAuthContext.jsx'
 import {
   fetchUsers, toggleUser, registerUser,
   fetchUserRooms, toggleUserRoom, fetchLogs,
 } from '../services/api'
+import useAudioRecorder from '../hooks/useAudioRecorder'
 
-const ROOM_NUMS = [1, 2, 3, 4, 5, 6]
+const ROOM_NUMS          = [1, 2, 3, 4, 5, 6]
+const MIN_ENROLL_SAMPLES = 3
 
 // confidence is stored/transmitted as 0-1 everywhere — this is the one place
 // it gets turned into a percentage for display.
@@ -44,8 +51,58 @@ export default function AdminPage () {
   // ── register-employee form state ──────────────────────────────────────
   const [regUsername, setRegUsername] = useState('')
   const [regFullName, setRegFullName] = useState('')
-  const [regFiles, setRegFiles]       = useState([])
+  const [regBlobs, setRegBlobs]       = useState([])   // P2: mic blobs, not file objects
+  const [regRecording, setRegRecording] = useState(false)
+  const [regCountdown, setRegCountdown] = useState(5)
   const [regBusy, setRegBusy]         = useState(false)
+
+  const regStopTimer  = useRef(null)
+  const regCdInterval = useRef(null)
+
+  // ── enrollment mic — separate instance from the prediction hook in ScanModal
+  const {
+    audioBlob: enrollBlob,
+    startRecording: startEnroll,
+    stopRecording:  stopEnroll,
+    error:          enrollMicError,
+  } = useAudioRecorder()
+
+  // each time a recording finishes, append its blob to the collection
+  useEffect(() => {
+    if (enrollBlob) setRegBlobs(prev => [...prev, enrollBlob])
+  }, [enrollBlob])
+
+  // cleanup timers on unmount
+  useEffect(() => () => {
+    clearTimeout(regStopTimer.current)
+    clearInterval(regCdInterval.current)
+  }, [])
+
+  const doEnrollRecord = async () => {
+    setRegCountdown(5)
+    setRegRecording(true)
+    await startEnroll()
+
+    regCdInterval.current = setInterval(() => {
+      setRegCountdown(cd => {
+        if (cd <= 1) { clearInterval(regCdInterval.current); return 0 }
+        return cd - 1
+      })
+    }, 1000)
+
+    regStopTimer.current = setTimeout(() => {
+      clearInterval(regCdInterval.current)
+      stopEnroll()
+      setRegRecording(false)
+    }, 5000)
+  }
+
+  const doEnrollStop = () => {
+    clearTimeout(regStopTimer.current)
+    clearInterval(regCdInterval.current)
+    stopEnroll()
+    setRegRecording(false)
+  }
 
   const loadAll = useCallback(async () => {
     setLoading(true)
@@ -92,8 +149,8 @@ export default function AdminPage () {
 
   async function handleRegister (e) {
     e.preventDefault()
-    if (!regUsername || !regFullName || regFiles.length < 3) {
-      setErrMsg('נדרשים שם משתמש, שם מלא ולפחות 3 הקלטות קוליות')
+    if (!regUsername || !regFullName || regBlobs.length < MIN_ENROLL_SAMPLES) {
+      setErrMsg(`נדרשים שם משתמש, שם מלא ולפחות ${MIN_ENROLL_SAMPLES} הקלטות קוליות`)
       return
     }
     setRegBusy(true)
@@ -101,9 +158,10 @@ export default function AdminPage () {
       const fd = new FormData()
       fd.append('username', regUsername)
       fd.append('fullName', regFullName)
-      regFiles.forEach((f) => fd.append('samples', f))
+      // same field name ('samples'), WAV PCM16 — same pipeline as prediction
+      regBlobs.forEach((blob, i) => fd.append('samples', blob, `sample_${i}.wav`))
       await registerUser(fd)
-      setRegUsername(''); setRegFullName(''); setRegFiles([])
+      setRegUsername(''); setRegFullName(''); setRegBlobs([])
       loadAll()
     } catch {
       setErrMsg('שגיאה ברישום משתמש — ייתכן ששם המשתמש כבר קיים')
@@ -155,14 +213,50 @@ export default function AdminPage () {
                   value={regFullName}
                   onChange={(e) => setRegFullName(e.target.value)}
                 />
-                <input
-                  className="ap-input ap-file"
-                  type="file"
-                  accept="audio/*"
-                  multiple
-                  onChange={(e) => setRegFiles(Array.from(e.target.files))}
-                />
-                <button className="ap-btn" type="submit" disabled={regBusy}>
+
+                {/* P2: mic recording — same pipeline as prediction */}
+                <div className="ap-enroll-rec">
+                  {!regRecording ? (
+                    <button
+                      type="button"
+                      className="ap-btn-rec"
+                      onClick={doEnrollRecord}
+                      disabled={regBusy}
+                    >
+                      🎙 הקלט דגימה {regBlobs.length + 1}
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      className="ap-btn-stop"
+                      onClick={doEnrollStop}
+                    >
+                      ■ עצור ({regCountdown}s)
+                    </button>
+                  )}
+                  <span className="ap-enroll-count">
+                    {regBlobs.length}/{MIN_ENROLL_SAMPLES} דגימות
+                    {regBlobs.length >= MIN_ENROLL_SAMPLES ? ' ✓' : ''}
+                  </span>
+                  {regBlobs.length > 0 && !regRecording && (
+                    <button
+                      type="button"
+                      className="ap-btn-clear"
+                      onClick={() => setRegBlobs([])}
+                    >
+                      נקה
+                    </button>
+                  )}
+                  {enrollMicError && (
+                    <span className="ap-enroll-err">שגיאת מיקרופון: {enrollMicError}</span>
+                  )}
+                </div>
+
+                <button
+                  className="ap-btn"
+                  type="submit"
+                  disabled={regBusy || regBlobs.length < MIN_ENROLL_SAMPLES || regRecording}
+                >
                   {regBusy ? 'רושם…' : 'רישום'}
                 </button>
               </form>
@@ -285,12 +379,31 @@ const CSS = `
   background: rgba(0,0,0,.3); border: 1px solid rgba(200,148,52,.25);
   border-radius: 8px; color: #f0e6d2; font-size: 13px;
 }
-.ap-file { color: #a8987a; }
 .ap-btn {
   padding: 10px 20px; border: none; border-radius: 8px;
   background: linear-gradient(180deg, #d9a544, #b8842c); color: #1a1208;
   font-weight: 700; font-size: 13px; cursor: pointer;
 }
+.ap-btn:disabled { opacity: 0.5; cursor: default; }
+
+.ap-enroll-rec { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.ap-btn-rec {
+  padding: 10px 18px; border: none; border-radius: 8px;
+  background: linear-gradient(180deg, #5a9ece, #3a7eb0); color: #fff;
+  font-weight: 700; font-size: 13px; cursor: pointer;
+}
+.ap-btn-rec:disabled { opacity: 0.5; cursor: default; }
+.ap-btn-stop {
+  padding: 10px 18px; border: none; border-radius: 8px;
+  background: linear-gradient(180deg, #e0566b, #b8344a); color: #f4e4e4;
+  font-weight: 700; font-size: 13px; cursor: pointer;
+}
+.ap-enroll-count { font-size: 12px; color: #a8987a; white-space: nowrap; }
+.ap-btn-clear {
+  background: none; border: 1px solid rgba(200,148,52,.3); border-radius: 6px;
+  color: #8a7a60; font-size: 11px; padding: 4px 10px; cursor: pointer;
+}
+.ap-enroll-err { font-size: 11px; color: #e0566b; }
 
 .ap-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .ap-table th { text-align: right; padding: 10px 8px; color: #8a7a60; font-weight: 500; border-bottom: 1px solid rgba(200,148,52,.2); }

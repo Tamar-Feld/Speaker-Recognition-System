@@ -18,8 +18,10 @@ import imageio_ffmpeg
 import uvicorn
 from silero_vad import get_speech_timestamps as _vad_timestamps
 from silero_vad import collect_chunks as _vad_collect
+import asyncio
 import threading
 import secrets
+from starlette.concurrency import run_in_threadpool
 from fastapi import Header
 AI_API_KEY = "5b61d4ae1aa4cbd5943b4d3876dc8e72a470bdc5f60be7675d4a31c8ad9befb8"
 
@@ -90,31 +92,32 @@ async def _lifespan(app: FastAPI):
     yield
 app = FastAPI(title="SpeakerAuth AI Engine", lifespan=_lifespan)
 
-# ── Audio Format Converter (WebM/Ogg -> WAV 16kHz Mono) ───────────────────────
-def convert_to_wav_mono_16khz(incoming_file: UploadFile) -> str:
+# ── הפיכת קריאת FFmpeg ללא-חוסמת ────────────────────────────────────────────
+# למה זה היה בעיה: subprocess.run חסם את כל ה-event loop של Python
+# עד שFFmpeg סיים — כלומר, בזמן ההמרה (מספר מאות ms) שום coroutine אחר
+# לא יכול היה לרוץ, גם אם הגיעו בינתיים בקשות חדשות לשרת.
+# מה השתנה: asyncio.create_subprocess_exec מפעיל את FFmpeg בתהליך-בן
+# ומחזיר מיד. await proc.communicate() מחכה לסיום בלי לחסום את ה-loop —
+# כלומר בזמן ההמרה, FastAPI יכול לטפל במקביל בבקשות אחרות.
+# גם הקריאה לקובץ שונתה: await incoming_file.read() במקום .file.read()
+# כי UploadFile.read() הוא ה-interface האסינכרוני הנכון ב-async context.
+async def convert_to_wav_mono_16khz(incoming_file: UploadFile) -> str:
     temp_dir = tempfile.gettempdir()
     temp_input = os.path.join(temp_dir, f"raw_audio_{uuid.uuid4().hex}.webm")
     temp_output = os.path.join(temp_dir, f"converted_audio_{uuid.uuid4().hex}.wav")
     try:
-        # Write the raw bytes from FastAPI UploadFile to disk
+        content = await incoming_file.read()
         with open(temp_input, "wb") as f:
-            f.write(incoming_file.file.read())
-        # Get the internal FFmpeg executable path
+            f.write(content)
         ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        # Build the FFmpeg command
-        command = [
-            ffmpeg_exe,
-            "-y",                  # Overwrite if exists
-            "-i", temp_input,      # Input file
-            "-ac", "1",            # Force 1 channel (mono)
-            "-ar", "16000",        # Force 16000Hz sample rate
-            "-loglevel", "error",  # Hide noisy logs
-            temp_output            # Output file
-        ]
-        # Run FFmpeg process
-        result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if result.returncode != 0:
-            error_msg = result.stderr.decode('utf-8', errors='ignore')
+        proc = await asyncio.create_subprocess_exec(
+            ffmpeg_exe, "-y", "-i", temp_input,
+            "-ac", "1", "-ar", "16000", "-loglevel", "error", temp_output,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            error_msg = stderr.decode("utf-8", errors="ignore")
             raise Exception(f"FFmpeg conversion failed: {error_msg}")
         return temp_output
     except Exception as e:
@@ -126,7 +129,6 @@ def convert_to_wav_mono_16khz(incoming_file: UploadFile) -> str:
             except OSError: pass
         raise HTTPException(status_code=400, detail=f"Audio conversion failed: {str(e)}")
     finally:
-        # Clean up the raw input file immediately
         if os.path.exists(temp_input):
             try: os.remove(temp_input)
             except OSError: pass
@@ -193,20 +195,28 @@ def extract_embedding(audio_src, n_segs: int = 5) -> torch.Tensor:
         embs = model(segs)
     return embs.mean(0).cpu()
 
-# ── POST /enroll ──────────────────────────────────────────────────────────────
+# ── הפיכת שני ה-endpoints ל-async, עם הפרדה מכוונת בין המתנה לחישוב ──────────
+# למה async def: כדי שנוכל לקרוא ל-convert_to_wav_mono_16khz עם await
+# (שכן עכשיו היא async ומשתמשת ב-asyncio.create_subprocess_exec).
+# למה run_in_threadpool סביב extract_embedding: VAD + Fbank + הרצת המודל הם
+# חישוב CPU כבד שחוסם אם ירוץ ישירות על event loop. run_in_threadpool
+# מעביר אותם ל-thread pool של Starlette — event loop נשאר חופשי בינתיים.
+# הנעילה _vad_lock בתוך extract_embedding עדיין עובדת נכון: run_in_threadpool
+# מריץ את הפונקציה כולה בבת אחת על thread אחד, כך שהנעילה הפנימית מגינה
+# כמו קודם בין קריאות מקבילות מ-threads שונים בpool.
 @app.post("/enroll", dependencies=[Depends(verify_api_key)])
-def enroll_speaker(file: UploadFile = File(...)):
+async def enroll_speaker(file: UploadFile = File(...)):
     if not weights_loaded:
         raise HTTPException(status_code=500, detail="AI model weights not loaded.")
 
     print(f"\n🆕 [AI Server] /enroll ← {file.filename}")
 
     # 1. Convert the uploaded file to a physical WAV file
-    wav_path = convert_to_wav_mono_16khz(file)
+    wav_path = await convert_to_wav_mono_16khz(file)
 
     try:
         # 2. Extract embedding using the physical WAV file path
-        emb_raw = extract_embedding(wav_path)
+        emb_raw = await run_in_threadpool(extract_embedding, wav_path)
         emb     = F.normalize(emb_raw, p=2, dim=0)
     except ValueError as e:
         err = str(e)
@@ -234,7 +244,7 @@ def enroll_speaker(file: UploadFile = File(...)):
 
 # ── POST /predict ─────────────────────────────────────────────────────────────
 @app.post("/predict", dependencies=[Depends(verify_api_key)])
-def predict_speaker(file: UploadFile = File(...), embeddings: str = Form(...)):
+async def predict_speaker(file: UploadFile = File(...), embeddings: str = Form(...)):
     if not weights_loaded:
         raise HTTPException(status_code=500, detail="AI model weights not loaded.")
     print(f"\n📥 [AI Server] /predict ← {file.filename}")
@@ -253,10 +263,10 @@ def predict_speaker(file: UploadFile = File(...), embeddings: str = Form(...)):
     if not candidates:
         return {"matched_username": None, "confidence": 0.0}
     # 1. Convert the uploaded file to a physical WAV file safely
-    wav_path = convert_to_wav_mono_16khz(file)
+    wav_path = await convert_to_wav_mono_16khz(file)
     try:
         # 2. Extract embedding using the physical WAV file path
-        emb_raw = extract_embedding(wav_path)
+        emb_raw = await run_in_threadpool(extract_embedding, wav_path)
         query   = F.normalize(emb_raw, p=2, dim=0)
     except ValueError as e:
         err = str(e)

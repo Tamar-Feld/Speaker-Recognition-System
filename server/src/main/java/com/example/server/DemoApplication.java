@@ -1,5 +1,6 @@
 package com.example.server;
 import org.springframework.web.client.RestTemplate;
+import org.springframework.web.reactive.function.client.WebClient;
 import com.example.server.entities.User;
 import com.example.server.repositories.AdminRepository;
 import com.example.server.repositories.UserRepository;
@@ -44,6 +45,16 @@ public class DemoApplication {
         factory.setReadTimeout(30_000);     // 30 שניות לתגובה מה-AI (inference זמן)
         return new RestTemplate(factory);
     }
+    // ── Bean חדש: WebClient — לקוח HTTP לא-חוסם ────────────────────────
+    // למה צריך Bean נפרד: restTemplate() שלמעלה ממשיך לשמש את UserService
+    // למסלול הרישום (/enroll דרך Java). WebClient משמש רק את AudioService
+    // למסלול הזיהוי (/predict), שם שחרור ה-thread הכי קריטי כי זה המסלול
+    // שנקרא הכי הרבה (כל ניסיון כניסה לכל דלת).
+    @Bean
+    public WebClient aiWebClient() {
+        return WebClient.builder().build();
+    }
+
     /**
      * פונקציית אתחול אוטומטית (Bootstrapping) הרצה ברגע שספרינג מסיים לעלות.
      */

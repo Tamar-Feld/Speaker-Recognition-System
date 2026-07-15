@@ -9,12 +9,8 @@
   static constexpr double M_PI = 3.14159265358979323846264338327950288;
 #endif
 
-/* ─── module-level twiddle table ──────────────────────────────────── */
-static std::vector<std::complex<double>> TWIDDLE_TABLE; //הטבלה ששומר את ערכי החישוב של cos וsin כדי שלא יחשבו כל פעם מחדש
+static std::vector<std::complex<double>> TWIDDLE_TABLE; // טבלה גלובלית לפקטורי הסיבוב (cos ו-sin), מחושבת פעם אחת כדי לא לחשב מחדש בכל קריאה
 
-/*
- * fft_build_twiddles(N)
- */
 inline void fft_build_twiddles(int N)
 {
     if ((N & (N - 1)) != 0) //בא נבדוק אם הN שייך לחזקות 2 אם לא זה שגיאה כי האלגוריתם דורש שאפשר לחלק את המערך ל2 שוב ושוב עד 1.
@@ -26,40 +22,57 @@ inline void fft_build_twiddles(int N)
     }
 }
 
-/*
- * fft_inplace(x)
- * --------------
- * In-place DFT  (forward, negative-exponent convention).
- * x.size() must equal the N passed to fft_build_twiddles().
- *
- * Twiddle lookup:  w = TWIDDLE_TABLE[j * step]
- *   where step = N / len.  Max index = N/2 - 1  (always in-bounds).
+/**
+ * מבצעת את פעולת ה-"פרפר" (Butterfly Operation) הקלאסית.
+ * מחשבת את השילוב של שני איברים מרוכבים בהתבסס על פקטור הסיבוב.
+ */
+inline void apply_butterfly_operation(
+    std::complex<double>& left_element,
+    std::complex<double>& right_element,
+    const std::complex<double>& twiddle_factor)
+{
+    const std::complex<double> u = left_element;
+    const std::complex<double> v = right_element * twiddle_factor;
+
+    left_element  = u + v;
+    right_element = u - v;
+}
+
+/**
+ * מבצעת איטרציה בודדת של שלב ה-FFT עבור בלוק נתון.
+ */
+inline void perform_fft_stage(
+    std::vector<std::complex<double>>& x,
+    int block_size,
+    int step)
+{
+    const int N = static_cast<int>(x.size());
+    const int half_block = block_size / 2;
+
+    for (int i = 0; i < N; i += block_size) {
+        for (int j = 0; j < half_block; ++j) {
+            const std::complex<double>& w = TWIDDLE_TABLE[j * step];
+
+            apply_butterfly_operation(
+                x[i + j],
+                x[i + j + half_block], w );
+        }// פקטור סיבוב עבור כל תדר
+    }
+}
+
+/**
+ * הפונקציה הראשית המנהלת את שלבי ה-FFT.
  */
 static void fft_inplace(std::vector<std::complex<double>>& x)
 {
     const int N = static_cast<int>(x.size());
-    assert(!TWIDDLE_TABLE.empty()                          // built?
-        && static_cast<int>(TWIDDLE_TABLE.size()) == N/2); // right size?
 
-    /* bit-reversal */ // מבצעים היפוךביטים כי כך האלגוריתם דורש את הסדר ההפוך ביטית ככה בסוף התוצאה מסודרת נכון בלי סידור נוסף
-    for (int i = 1, j = 0; i < N; ++i) {
-        int bit = N >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) std::swap(x[i], x[j]);
-    }
+    // שלב 1: סידור מחדש של המערך לפי היפוך ביטים (Bit-Reversal)
+    perform_bit_reversal(x);
 
-    /* butterfly stages — twiddle lookup, zero accumulated drift */
-    for (int len = 2; len <= N; len <<= 1) {
-        const int step = N / len;                  // index stride into table
-        for (int i = 0; i < N; i += len) {
-            for (int j = 0; j < len / 2; ++j) {
-                const std::complex<double>  w = TWIDDLE_TABLE[j * step];
-                const std::complex<double>  u = x[i + j];
-                const std::complex<double>  v = x[i + j + len/2] * w;
-                x[i + j]           = u + v;
-                x[i + j + len/2]   = u - v;
-            }
-        }
+    // שלב 2: ביצוע שלבי ה-FFT באיטרציות (Radix-2)
+    for (int block_size = 2; block_size <= N; block_size <<= 1) {
+        const int step = N / block_size;
+        perform_fft_stage(x, block_size, step);
     }
 }

@@ -70,11 +70,6 @@ export default function DoorPage () {
             <div className="dp-status-main">{isProcessing ? 'מנתח טביעת קול…' : statusText}</div>
             <div className="dp-status-sub">{isProcessing ? 'ECAPA-TDNN · EER 4.12%' : statusSub}</div>
 
-            {!isProcessing && state && confidence > 0 && (
-              <div className="dp-conf">
-                ביטחון זיהוי: {Math.round(confidence * 100)}%
-              </div>
-            )}
 
             {!isProcessing && !granted && state && (
               <button className="dp-retry" onClick={() => navigate('/')}>חזרה ללובי לניסיון נוסף</button>

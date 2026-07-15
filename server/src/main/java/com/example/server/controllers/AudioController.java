@@ -10,17 +10,7 @@ import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.util.Map;
-
-// ═══════════════════════════════════════════════════════════════════
-// AudioController — שכבת ה-HTTP (Thin Controller) לבקשות אודיו.
-//
-// ארכיטקטורה ונקודות לציון:
-// - הזרקת תלויות: Constructor Injection.
-// - אבטחת מידע: שגיאות פנימיות מתועדות בלוג השרת (SLF4J) ולא
-//   נחשפות ישירות ללקוח כדי למנוע Information Disclosure.
-// - ולידציה: סינון קבצים ריקים לפני פנייה לשכבה העסקית.
-// - Type Safety: שימוש ב-record במקום Map לבניית אובייקט השגיאה.
-// ═══════════════════════════════════════════════════════════════════
+import java.util.concurrent.CompletableFuture;
 
 @RestController
 @RequestMapping("/api/audio")
@@ -69,8 +59,14 @@ public class AudioController {
 
     // ── Endpoints ──────────────────────────────────────────────────
 
+    // thread פתוח מרגע קבלת הבקשה עד שPython סיים לנתח קול (לפעמים 1-2 שניות).
+    // כשהרבה דלתות שולחות בקשה בו-זמנית, pool ה-threads מתדלדל.
+    // מה השתנה: החזרת CompletableFuture מאותתת ל-Spring MVC לשחרר את ה-thread
+    // מיד לאחר שאימות האבטחה הסינכרוני עבר, ולחכות לתוצאה ב-callback.
+    // כל בדיקות האבטחה (rate-limit, timestamp, nonce) נשארות סינכרוניות בדיוק
+    // כמו לפני — הן מהירות ולא חוסמות; רק קריאת ה-HTTP ל-Python משוחררת.
     @PostMapping("/upload")
-    public ResponseEntity<?> uploadFile(
+    public CompletableFuture<ResponseEntity<?>> uploadFile(
             @RequestParam("file") MultipartFile file,
             @RequestParam("roomId") int roomId,
             @RequestParam("timestamp") long timestamp,
@@ -79,47 +75,59 @@ public class AudioController {
 
         String clientIp = httpRequest.getRemoteAddr();
         long now = System.currentTimeMillis();
-        // 1. הגבלת קצב —שלא ישלחו ברציפות לנסות לנחש
+
+        // 1. הגבלת קצב — שלא ישלחו ברציפות לנסות לנחש
         if (isRateLimited(roomId)) {
             logger.warn("Rate limit exceeded for room {}", roomId);
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                    .body(new AccessResponse(false, "unknown", 0.0, "⛔ יותר מדי ניסיונות, נסי שוב בעוד רגע"));
+            return CompletableFuture.completedFuture(
+                    ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                            .body(new AccessResponse(false, "unknown", 0.0, "⛔ יותר מדי ניסיונות, נסי שוב בעוד רגע")));
         }
+
         // 2. חלון זמן — דוחה בקשות ישנות שנתפסו ונשלחות מאוחר
         if (Math.abs(now - timestamp) > TIMESTAMP_WINDOW_MS) {
             logger.warn("Rejected stale/future request for room {} (diff: {}ms)", roomId, now - timestamp);
-            return ResponseEntity.badRequest()
-                    .body(new AccessResponse(false, "unknown", 0.0, "⛔ הבקשה פגה תוקף, נסי שוב"));
+            return CompletableFuture.completedFuture(
+                    ResponseEntity.badRequest()
+                            .body(new AccessResponse(false, "unknown", 0.0, "⛔ הבקשה פגה תוקף, נסי שוב")));
         }
 
         // 3. nonce ייחודי — דוחה שידור חוזר של אותה בקשה בדיוק
         cleanupExpiredNonces(now);
         if (usedNonces.putIfAbsent(nonce, now) != null) {
             logger.warn("Rejected replayed request for room {} (duplicate nonce)", roomId);
-            return ResponseEntity.status(HttpStatus.CONFLICT)
-                    .body(new AccessResponse(false, "unknown", 0.0, "⛔ בקשה כפולה זוהתה"));
+            return CompletableFuture.completedFuture(
+                    ResponseEntity.status(HttpStatus.CONFLICT)
+                            .body(new AccessResponse(false, "unknown", 0.0, "⛔ בקשה כפולה זוהתה")));
         }
-        // 1. ולידציה בסיסית של הקלט (Guard Clause)
+
+        // 4. ולידציה בסיסית של הקלט (Guard Clause)
         if (file.isEmpty()) {
             logger.warn("Received empty audio file for room {}", roomId);
-            return ResponseEntity.badRequest()
-                    .body(new AccessResponse(false, "unknown", 0.0, "⛔ Error: No audio file provided"));
+            return CompletableFuture.completedFuture(
+                    ResponseEntity.badRequest()
+                            .body(new AccessResponse(false, "unknown", 0.0, "⛔ Error: No audio file provided")));
         }
 
+        // 5. קריאה לא-חוסמת ללוגיקה העסקית
+        CompletableFuture<ResponseEntity<?>> future;
         try {
-            // 2. קריאה ללוגיקה העסקית (שממוקמת ב-AudioService)
-            Map<String, Object> result = audioService.identifyAndCheckAccess(file, roomId, clientIp);            return ResponseEntity.ok(result);
-
+            future = audioService.identifyAndCheckAccessAsync(file, roomId, clientIp)
+                                 .thenApply(ResponseEntity::ok);
         } catch (Exception e) {
-            // 3. תיעוד השגיאה האמיתית בצד השרת בלבד (SLF4J)
+            // שגיאות סינכרוניות לפני שהבקשה נשלחה (למשל file.getBytes() נכשל)
             logger.error("Error processing audio access for room {}: {}", roomId, e.getMessage(), e);
-
-            // 4. שמירת לוג הכישלון במסד הנתונים
             audioService.saveFailedLog(file.getOriginalFilename(), roomId, clientIp);
-            // 5. החזרת שגיאה עמומה וגנרית ללקוח (אבטחת מידע)
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(buildErrorResponse());
+            return CompletableFuture.completedFuture(
+                    ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(buildErrorResponse()));
         }
+
+        // שגיאות אסינכרוניות: Python לא זמין, timeout, שגיאת רשת
+        return future.exceptionally(ex -> {
+            logger.error("Async error processing audio access for room {}: {}", roomId, ex.getMessage(), ex);
+            audioService.saveFailedLog(file.getOriginalFilename(), roomId, clientIp);
+            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(buildErrorResponse());
+        });
     }
 
     /**

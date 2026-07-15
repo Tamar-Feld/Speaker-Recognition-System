@@ -23,7 +23,7 @@ export const loginAdmin = (username, password) =>
 // → { accessGranted, identifiedSpeaker, confidence (0–1), message }
 export const uploadAudio = (file, roomId) => {
   const fd = new FormData()
-  fd.append('file', file, 'recording.webm')
+  fd.append('file', file, 'recording.wav')
   fd.append('roomId', roomId)
   fd.append('timestamp', Date.now().toString())
   fd.append('nonce', crypto.randomUUID())
