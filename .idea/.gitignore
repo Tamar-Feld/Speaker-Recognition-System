@@ -3,3 +3,42 @@
 /workspace.xml
 # Editor-based HTTP Client requests
 /httpRequests/
+# JetBrains / IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Java / Maven / Spring Boot
+target/
+*.class
+*.jar
+*.war
+
+# Python & Virtual Environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# ML Models & Heavy Audio Files
+*.pth
+*.pt
+*.onnx
+*.bin
+*.wav
+*.mp3
+
+# OS Generated Files
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
+*.jit
+*.pyd
+*.lib
+*.exp
+ai_engine/dsp_module/build/
